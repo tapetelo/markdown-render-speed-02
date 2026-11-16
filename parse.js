@@ -800,13 +800,15 @@ function textChunkLen(rest) {
   return len;
 }
 
+const RE_TEXT_NEEDS = /[&<>"']/;
+
+const RE_FAST = /[\\`*_!\[<~]|www\.|:\/\/|@| {2}\n/;
+
 function renderInlineInner(src, ctx, mode) {
   // Fast path: nothing here can start a construct, open an autolink, or
-  // make a hard break, so the run is one text chunk.
-  if (!src.includes('\\') && !src.includes('`') && !src.includes('*') && !src.includes('_')
-    && !src.includes('[') && !src.includes('!') && !src.includes('<') && !src.includes('~')
-    && !src.includes('www.') && !src.includes('://') && !src.includes('@')
-    && !src.includes('  \n')) {
+  // make a hard break, so the run is one text chunk. One regex test
+  // replaces thirteen separate scans.
+  if (!RE_FAST.test(src)) {
     const decoded = decodeNumericRefs(src);
     return mode === 'text' ? decoded : escHtml(decoded);
   }
@@ -821,6 +823,7 @@ function renderInlineInner(src, ctx, mode) {
     if (!keepPrev) prevChar = '';
     keepPrev = false;
     let r = null;
+    let textChunk = 0;
     const ch = rest[0];
     const cc0 = rest.charCodeAt(0);
     if (cc0 < 128 && CC_TEXTONLY[cc0]) {
@@ -831,14 +834,9 @@ function renderInlineInner(src, ctx, mode) {
         while (rest[q] === ' ') q++;
         hardBreak = q >= 2 && rest[q] === '\n';
       }
-      if (!hardBreak) {
-        const chunk = textChunkLen(rest) || 1;
-        const raw = rest.slice(0, chunk);
-        const text = ctx.inRaw ? raw : decodeNumericRefs(raw);
-        r = { html: mode === 'text' ? text : (ctx.inRaw ? text : escHtml(text)), len: chunk, isText: true };
-      }
+      if (!hardBreak) textChunk = textChunkLen(rest) || 1;
     }
-    if (!r) {
+    if (!r && !textChunk) {
       if (ch === '\\') {
         const cap = RE_INLINE_ESCAPE.exec(rest);
         if (cap) r = { html: mode === 'text' ? cap[1] : escHtml(cap[1]), len: 2 };
@@ -899,11 +897,25 @@ function renderInlineInner(src, ctx, mode) {
         if (urlMaybe) r = tryUrl(rest, ctx, mode);
       }
     }
-    if (!r) {
-      const chunk = textChunkLen(rest) || 1;
-      const raw = rest.slice(0, chunk);
-      const text = ctx.inRaw ? raw : decodeNumericRefs(raw);
-      r = { html: mode === 'text' ? text : (ctx.inRaw ? text : escHtml(text)), len: chunk, isText: true };
+    if (!r && !textChunk) {
+      textChunk = textChunkLen(rest) || 1;
+    }
+    if (textChunk) {
+      // Text chunks are the common case: emit them without allocating a
+      // result object. When the chunk holds none of & < > " ', both the
+      // numeric-reference decode and the escape are identity, so one test
+      // replaces two regex passes.
+      const raw = rest.slice(0, textChunk);
+      if (ctx.inRaw || !RE_TEXT_NEEDS.test(raw)) {
+        out.push(raw);
+      } else {
+        const text = decodeNumericRefs(raw);
+        out.push(mode === 'text' ? text : escHtml(text));
+      }
+      if (rest[textChunk - 1] !== '_') prevChar = rest[textChunk - 1];
+      keepPrev = true;
+      rest = rest.slice(textChunk);
+      continue;
     }
     if (!r) {
       // Nothing matched: emit one literal character rather than stalling.
@@ -1078,7 +1090,33 @@ function lineBreakKind(line) {
   return 0;
 }
 
+// Index of the first character that is not a space, or -1 (like
+// s.search(/[^ ]/)). True when a single line holds only whitespace
+// (like !s.trim()). Column of the first non-space character with each
+// tab counting as four spaces (like s.replace(/\t/g, '    ').search(...)).
+function firstNonSpace(s) {
+  let k = 0;
+  while (s.charCodeAt(k) === 32) k++;
+  return k < s.length ? k : -1;
+}
+const RE_BLANK_ONLY = /^\s*$/;
+function expandedIndent(s) {
+  let col = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 32) col++;
+    else if (c === 9) col += 4;
+    else return col;
+  }
+  return -1;
+}
 function tryList(src, ctx) {
+  // A list starts with a bullet (-, *, +) or a digit after at most three
+  // spaces; anything else cannot match, so skip the regex entirely.
+  let i = 0;
+  while (i < 3 && src.charCodeAt(i) === 32) i++;
+  const c0 = src.charCodeAt(i);
+  if (c0 !== 45 && c0 !== 42 && c0 !== 43 && !(c0 >= 48 && c0 <= 57)) return null;
   const cap0 = RE_LIST_START.exec(src);
   if (!cap0) return null;
   const listSrc = src;
@@ -1094,7 +1132,7 @@ function tryList(src, ctx) {
   let endsWithBlank = false;
   while (rest.length) {
     let endEarly = false;
-    let itemContents = '';
+    const itemParts = [];
     const cap = itemRe.exec(rest);
     if (!cap) break;
     if (RE_HR.test(rest)) break;
@@ -1106,14 +1144,14 @@ function tryList(src, ctx) {
     let line = line0;
     const nl0 = rest.indexOf('\n');
     let nextLine = nl0 === -1 ? rest : rest.slice(0, nl0);
-    let blankLine = !line.trim();
+    let blankLine = RE_BLANK_ONLY.test(line);
     let indent;
     if (blankLine) {
       indent = bulletIndent + 1;
     } else {
-      indent = line.search(/[^ ]/);
+      indent = firstNonSpace(line);
       indent = indent > 4 ? 1 : indent;
-      itemContents = line.slice(indent);
+      itemParts.push(line.slice(indent));
       indent += bulletIndent;
     }
     if (blankLine && RE_BLANK_LINE.test(nextLine)) {
@@ -1145,11 +1183,11 @@ function tryList(src, ctx) {
         } else if (kind === 3) {
           if (nextBulletRe.test(nextLine)) break;
         }
-        if (nextLineNoTabs.search(/[^ ]/) >= indent || !nextLine.trim()) {
-          itemContents += '\n' + nextLineNoTabs.slice(indent);
+        if (firstNonSpace(nextLineNoTabs) >= indent || RE_BLANK_ONLY.test(nextLine)) {
+          itemParts.push(nextLineNoTabs.slice(indent));
         } else {
           if (blankLine) break;
-          if (line.indexOf('\t') !== -1 ? line.replace(/\t/g, '    ').search(/[^ ]/) >= 4 : line.search(/[^ ]/) >= 4) break;
+          if (expandedIndent(line) >= 4) break;
           const lkind = lineBreakKind(line);
           if (lkind === 1) {
             if (fencesRe.test(line)) break;
@@ -1165,9 +1203,9 @@ function tryList(src, ctx) {
           const cont = setextCont
             ? '    ' + nextLineNoTabs.replace(/^ {0,3}/, '')
             : nextLine;
-          itemContents += '\n' + cont;
+          itemParts.push(cont);
         }
-        blankLine = !nextLine.trim();
+        blankLine = RE_BLANK_ONLY.test(nextLine);
         rest = nl === -1 ? '' : rest.slice(nl + 1);
         line = nextLineNoTabs.slice(indent);
       }
@@ -1177,7 +1215,7 @@ function tryList(src, ctx) {
       if (endsWithBlank) list.loose = true;
       else if (/\n[ \t]*\n[ \t]*$/.test(raw)) endsWithBlank = true;
     }
-    list.items.push({ task: false, text: itemContents, kids: [], raw });
+    list.items.push({ task: false, text: itemParts.join('\n'), kids: [], raw });
   }
   const lastItem = list.items[list.items.length - 1];
   if (!lastItem) return null;
